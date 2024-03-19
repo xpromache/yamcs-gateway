@@ -9,6 +9,7 @@ use msg::YgwMessage;
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender};
 use async_trait::async_trait;
+use yamcs::protobuf;
 
 pub mod yamcs {
     use core::f32;
@@ -78,7 +79,18 @@ pub struct YgwLinkNodeProperties {
 #[derive(Clone, Debug)]
 pub struct Link {
     id: u32,
-    properties: YgwLinkNodeProperties,
+    props: YgwLinkNodeProperties,
+}
+impl Link {
+    fn to_proto(&self) -> protobuf::ygw::Link {
+        protobuf::ygw::Link {
+            id: self.id,
+            name: self.props.name.clone(),
+            description: Some(self.props.description.clone()),
+            tm: if self.props.tm {Some(true)} else {None},
+            tc: if self.props.tc {Some(true)} else {None},
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, YgwError>;

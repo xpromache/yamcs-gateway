@@ -23,7 +23,7 @@
 //! - PreparedCommand protobuf encoded
 //!
 //!
-use std::{collections::HashMap, future, net::SocketAddr};
+use std::{collections::HashMap, net::SocketAddr};
 
 use bytes::Bytes;
 
@@ -42,9 +42,12 @@ use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 
 use crate::{
     hex8,
-    msg::{self, YgwMessage},
-    yamcs::protobuf::{self, ygw},
-    Result, YgwError, YgwLinkNodeProperties, YgwNode,
+    msg::{self, Addr, YgwMessage},
+    yamcs::protobuf::{
+        self,
+        ygw::MessageType,
+    },
+    Link, Result, YgwError, YgwLinkNodeProperties, YgwNode,
 };
 
 pub enum CtrlMessage {
@@ -99,7 +102,7 @@ impl Server {
     ///
     pub async fn start(mut self) -> Result<ServerHandle> {
         let mut node_tx_map = HashMap::new();
-        let mut node_details_map = HashMap::new();
+        let mut node_data = HashMap::new();
         let mut node_id = 0;
         let mut handles = Vec::new();
 
@@ -111,17 +114,7 @@ impl Server {
         for mut node in self.nodes.drain(..) {
             let props = node.properties();
             let (tx, rx) = tokio::sync::mpsc::channel(100);
-
-            let node_proto = protobuf::ygw::Node {
-                id: node_id,
-                name: props.name.clone(),
-                description: Some(props.description.clone()),
-                tm: Some(props.tm),
-                tc: Some(props.tc),
-                links: vec![],
-                parameters: vec![],
-            };
-            node_details_map.insert(node_id, node_proto);
+            node_data.insert(node_id, NodeData::new(node_id, props, node.sub_links()));
 
             let encoder_tx = encoder_tx.clone();
             log::info!("Starting node {} with id {}", props.name, node_id);
@@ -138,7 +131,7 @@ impl Server {
         let accepter_jh =
             tokio::spawn(async move { accepter_task(ctrl_tx, socket, decoder_tx).await });
 
-        tokio::spawn(async move { encoder_task(ctrl_rx, encoder_rx, node_details_map).await });
+        tokio::spawn(async move { encoder_task(ctrl_rx, encoder_rx, node_data).await });
 
         tokio::spawn(async move { decoder_task(decoder_rx, node_tx_map).await });
 
@@ -167,16 +160,58 @@ impl PartialEq for YamcsConnection {
         self.addr == other.addr
     }
 }
+
+// used in the encoder stores data about nodes
+struct NodeData {
+    node_id: u32,
+    props: YgwLinkNodeProperties,
+    links: Vec<Link>,
+    /// collects the parameter definitions as sent by the node
+    /// sent in bulk to Yamcs upon connection
+    para_defs: protobuf::ygw::ParameterDefinitionList,
+    /// collects the parameter values per group as sent by the node
+    /// sent in bulk to Yamcs upon connection
+    para_values: HashMap<String, protobuf::ygw::ParameterData>,
+
+    /// collects the link status per link
+    /// sent in bulk to Yamcs upon connection
+    link_status: HashMap<u32, protobuf::ygw::LinkStatus>,
+}
+impl NodeData {
+    fn new(node_id: u32, props: &YgwLinkNodeProperties, links: &[Link]) -> Self {
+        Self {
+            node_id,
+            props: props.clone(),
+            links: links.to_vec(),
+            para_defs: protobuf::ygw::ParameterDefinitionList {
+                definitions: Vec::new(),
+            },
+            para_values: HashMap::new(),
+            link_status: HashMap::new(),
+        }
+    }
+
+    fn node_to_proto(&self) -> protobuf::ygw::Node {
+        protobuf::ygw::Node {
+            id: self.node_id,
+            name: self.props.name.clone(),
+            description: Some(self.props.description.clone()),
+            tm: if self.props.tm { Some(true) } else { None },
+            tc: if self.props.tc { Some(true) } else { None },
+            links: self.links.iter().map(|l| l.to_proto()).collect(),
+        }
+    }
+}
+
 /// listens for new messages from the targets
 /// encodes them to bytes and sends the bytes to all writer tasks (to be sent to Yamcs)
 ///
 async fn encoder_task(
     mut ctrl_rx: Receiver<CtrlMessage>,
     mut encoder_rx: Receiver<YgwMessage>,
-    mut nodes: HashMap<u32, protobuf::ygw::Node>,
+    mut nodes: HashMap<u32, NodeData>,
 ) -> Result<()> {
     let mut connections: Vec<YamcsConnection> = Vec::new();
-    let mut param_cache: HashMap<String, protobuf::ygw::ParameterValue> = HashMap::new();
 
     loop {
         select! {
@@ -184,14 +219,23 @@ async fn encoder_task(
                 match msg {
                     Some(msg) => {
                         let buf = msg.encode().freeze();
-                        send_to_all(&mut connections, buf).await;
+                        send_data_to_all(&mut connections, buf).await;
                         match msg {
                             YgwMessage::ParameterDefs(addr, pdefs) => {
                                 if let Some(node) = nodes.get_mut(&addr.node_id()) {
-                                    node.parameters.extend(pdefs.definitions);                                    
-                                }                          
+                                    node.para_defs.definitions.extend(pdefs.definitions);
+                                }
                             },
-                            YgwMessage::Parameters(_, _) => todo!(),
+                            YgwMessage::Parameters(addr, pvals) => {
+                                if let Some(node) = nodes.get_mut(&addr.node_id()) {
+                                    node.para_values.insert(pvals.group.clone(), pvals);
+                                }
+                            },
+                            YgwMessage::LinkStatus(addr, link_status) => {
+                                if let Some(node) = nodes.get_mut(&addr.node_id()) {
+                                    node.link_status.insert(addr.link_id(), link_status);
+                                }
+                            },
                             _ => {}
                         }
                     },
@@ -201,15 +245,12 @@ async fn encoder_task(
             msg = ctrl_rx.recv() => {
                 match msg {
                     Some(CtrlMessage::NewYamcsConnection(yc)) => {
-                        if let Err(_)= send_nodes_info(&yc, &nodes).await {
-                            log::warn!("Error sending node info message to {}", yc.addr);
+                        if let Err(_)= send_initial_data(&yc, &nodes).await {
+                            log::warn!("Error sending initial data message to {}", yc.addr);
                             continue;
                         }
-                        if let Err(_)= send_pvalues(&yc, &param_cache).await {
-                            log::warn!("Error sending parameter values to {}", yc.addr);
-                            continue;
-                        }
-                        
+
+
                         connections.push(yc);
                     },
                     Some(CtrlMessage::YamcsConnectionClosed(addr)) => connections.retain(|yc| yc.addr != addr),
@@ -221,8 +262,8 @@ async fn encoder_task(
     Ok(())
 }
 
-async fn send_to_all(connections: &mut Vec<YamcsConnection>, buf: Bytes) {
-    
+/// send encoded message to all connected yamcs servers
+async fn send_data_to_all(connections: &mut Vec<YamcsConnection>, buf: Bytes) {
     let mut idx = 0;
     while idx < connections.len() {
         let buf1 = buf.clone();
@@ -247,22 +288,53 @@ async fn send_to_all(connections: &mut Vec<YamcsConnection>, buf: Bytes) {
     }
 }
 
-async fn send_nodes_info(
+/// Called when there is a new Yamcs connection
+/// Sends node information, parameter definitions and parameter values
+async fn send_initial_data(
     yc: &YamcsConnection,
-    nodes: &HashMap<u32, protobuf::ygw::Node>,
+    nodes: &HashMap<u32, NodeData>,
 ) -> std::result::Result<(), SendError<Bytes>> {
-    let l = protobuf::ygw::NodeList {
-        nodes: nodes.values().cloned().collect(),
+    //send the node information
+    let nl = protobuf::ygw::NodeList {
+        nodes: nodes
+            .iter()
+            .map(|(_, &ref nd)| nd.node_to_proto())
+            .collect(),
     };
-    let buf = msg::encode_node_info(&l);
-    yc.chan_tx.send(buf.freeze()).await
-}
+    let buf = msg::encode_node_info(&nl);
+    yc.chan_tx.send(buf.freeze()).await?;
 
-async fn send_pvalues(
-    yc: &YamcsConnection,
-    pvalues: &HashMap<String, protobuf::ygw::ParameterValue>,
-) -> std::result::Result<(), SendError<Bytes>> {
-   todo!()    
+    //send the parameter defintions
+    for nd in nodes.values() {
+        let buf = msg::encode_message(
+            &Addr::new(nd.node_id, 0),
+            MessageType::ParameterDefinitions,
+            &nd.para_defs,
+        );
+        yc.chan_tx.send(buf.freeze()).await?;
+    }
+
+    //send the parameter values
+    for nd in nodes.values() {
+        for pdata in nd.para_values.values() {
+            let buf =
+                msg::encode_message(&Addr::new(nd.node_id, 0), MessageType::ParameterData, pdata);
+            yc.chan_tx.send(buf.freeze()).await?;
+        }
+    }
+
+    // send the link status
+    for nd in nodes.values() {
+        for lstatus in nd.link_status.values() {
+            let buf = msg::encode_message(
+                &Addr::new(nd.node_id, lstatus.link_id),
+                MessageType::LinkStatus,
+                lstatus,
+            );
+            yc.chan_tx.send(buf.freeze()).await?;
+        }
+    }
+    Ok(())
 }
 
 /// receives data from the yamcs readers, converts them to messages
