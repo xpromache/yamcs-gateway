@@ -211,7 +211,7 @@ async fn execute_cmd(
                 return Err(YgwError::CommandError(format!("Invalid data {:?}", data)));
             };
             log::debug!("Sending {:?}", frame);
-            socket.write_frame(CanFrame::Data(frame))?.await?;
+            socket.write_frame(CanFrame::Data(frame)).await?;
             state.link_status.data_out(1, frame.len() as u64);
         }
         CMD_SEND_REMOTE_FRAME_ID => {
@@ -224,7 +224,7 @@ async fn execute_cmd(
                 return Err(YgwError::CommandError(format!("Invalid dlc = {}", dlc)));
             };
             log::debug!("Sending {:?}", frame);
-            socket.write_frame(CanFrame::Remote(frame))?.await?;
+            socket.write_frame(CanFrame::Remote(frame)).await?;
             state.link_status.data_out(1, frame.len() as u64);
         }
         _ => {
