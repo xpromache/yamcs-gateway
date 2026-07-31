@@ -122,7 +122,7 @@ impl Server {
     ///  * One acceptor task for accepting Yamcs connections.
     ///  * One encoder task for encoding messages from nodes and sending them to Yamcs
     ///  * One decoder task for decoding messages from Yamcs and sending them to nodes
-    ///     
+    ///
     ///
     pub async fn start(mut self) -> Result<ServerHandle> {
         let mut node_tx_map = HashMap::new();
@@ -396,6 +396,12 @@ async fn encoder_task(
                             YgwMessage::ParameterDefinitions(addr, pdefs) => {
                                 if let Some(node) = nodes.get_mut(&addr.node_id()) {
                                     for def in pdefs.definitions {
+                                        // If there exists a parameter with the same ID but a different relative name, we don't want to override it
+                                        if let Some(other_with_same_id) = node.para_defs.definitions.iter().find(|x| x.relative_name != def.relative_name && x.id == def.id) {
+                                            log::warn!("Parameter {} with ID {} would override existing parameter {} with same ID, not updating it", def.relative_name, def.id, other_with_same_id.relative_name);
+                                            continue;
+                                        }
+
                                         if let Some(pos) = node.para_defs.definitions.iter().position(|x| x.relative_name == def.relative_name) {
                                             node.para_defs.definitions[pos] = def;
                                         } else {
@@ -417,6 +423,12 @@ async fn encoder_task(
                             YgwMessage::CommandDefinitions(addr, cmd_defs) => {
                                 if let Some(node) = nodes.get_mut(&addr.node_id()) {
                                     for def in cmd_defs.definitions {
+                                        // If there exists a command with the same ID but a different relative name, we don't want to override it
+                                        if let Some(other_with_same_id) = node.cmd_defs.definitions.iter().find(|x| x.relative_name != def.relative_name && x.ygw_cmd_id == def.ygw_cmd_id) {
+                                            log::warn!("Command {} with ID {} would override existing command {} with same ID, not updating it", def.relative_name, def.ygw_cmd_id, other_with_same_id.relative_name);
+                                            continue;
+                                        }
+
                                         if let Some(pos) = node.cmd_defs.definitions.iter().position(|x| x.relative_name == def.relative_name) {
                                             node.cmd_defs.definitions[pos] = def;
                                         } else {
