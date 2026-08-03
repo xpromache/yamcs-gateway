@@ -128,7 +128,6 @@ impl Server {
         let mut node_tx_map = HashMap::new();
         let mut node_data = HashMap::new();
         let mut node_id = 0;
-        let mut handles = Vec::new();
 
         let (encoder_tx, encoder_rx) = tokio::sync::mpsc::channel(100);
 
@@ -140,13 +139,24 @@ impl Server {
 
         for node in self.nodes.drain(..) {
             let props = node.properties();
+            let node_name = props.name.clone();
             let (tx, rx) = tokio::sync::mpsc::channel(100);
             node_data.insert(node_id, NodeData::new(node_id, props, node.sub_links()));
 
             let encoder_tx = encoder_tx.clone();
-            log::info!("Starting node {} with id {}", props.name, node_id);
-            let jh = tokio::spawn(async move { node.run(node_id, encoder_tx, rx).await });
-            handles.push(jh);
+            let node_name_clone = node_name.clone();
+            log::info!("Starting node {} with id {}", node_name, node_id);
+            tokio::spawn(async move {
+                match node.run(node_id, encoder_tx, rx).await {
+                    Ok(()) => {
+                        log::info!("Node {} exited normally", node_name_clone);
+                    }
+                    Err(e) => {
+                        println!("Node {} exited with error: {:?}", node_name_clone, e);
+                        log::error!("Node {} exited with error: {:?}", node_name_clone, e);
+                    }
+                }
+            });
 
             node_tx_map.insert(node_id, tx);
             node_id += 1;
@@ -228,11 +238,14 @@ impl ServerHandle {
             cancel_token.cancel();
             Ok::<(), std::io::Error>(())
         });
-
-        match jh.await {
+        
+        // Wait for main server task
+        let server_result = match jh.await {
             Ok(result) => result,
             Err(e) => Err(e.into()),
-        }
+        };
+
+        server_result
     }
 }
 
